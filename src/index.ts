@@ -2,7 +2,9 @@
 
 // Data一般用于表示从服务器上请求到的数据，Info一般表示解析并筛选过的要传输给大模型的数据。变量使用驼峰命名，常量使用全大写下划线命名。
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import express from 'express';
+import { Request, Response } from 'express';
 import axios from 'axios';
 import { z } from 'zod';
 import { format, parse } from 'date-fns';
@@ -24,7 +26,7 @@ import {
 const VERSION = "0.3.2"
 const API_BASE = 'https://kyfw.12306.cn';
 const WEB_URL = 'https://www.12306.cn/index/';
-const LCQUERY_INIT_URL = "https://kyfw.12306.cn/otn/lcQuery/init"
+const LCQUERY_INIT_URL = 'https://kyfw.12306.cn/otn/lcQuery/init';
 const LCQUERY_PATH = await getLCQueryPath();
 const MISSING_STATIONS: StationData[] = [
   {
@@ -319,7 +321,10 @@ function parseTicketsData(rawData: string[]): TicketData[] {
   return result;
 }
 
-function parseTicketsInfo(ticketsData: TicketData[], map:Record<string,string>): TicketInfo[] {
+function parseTicketsInfo(
+  ticketsData: TicketData[],
+  map: Record<string, string>
+): TicketInfo[] {
   const result: TicketInfo[] = [];
   for (const ticket of ticketsData) {
     const prices = extractPrices(
@@ -373,7 +378,7 @@ function formatTicketStatus(num: string): string {
       return `剩余${count}张票`;
     }
   }
-  
+
   // 处理特殊状态字符串
   switch (num) {
     case '有':
@@ -592,18 +597,18 @@ function extractPrices(
       (i + 1) * PRICE_STR_LENGTH
     );
     var seat_type_code;
-    if (parseInt(price_str.slice(6, 10), 10) >= 3000){ // 根据12306的js逆向出来的，不懂。
+    if (parseInt(price_str.slice(6, 10), 10) >= 3000) {
+      // 根据12306的js逆向出来的，不懂。
       seat_type_code = 'W'; // 为无座
-    }
-    else if(!Object.keys(SEAT_TYPES).includes(price_str[0])){
+    } else if (!Object.keys(SEAT_TYPES).includes(price_str[0])) {
       seat_type_code = 'H'; // 其他坐席
-    }
-    else{
+    } else {
       seat_type_code = price_str[0];
     }
     const seat_type = SEAT_TYPES[seat_type_code as keyof typeof SEAT_TYPES];
     const price = parseInt(price_str.slice(1, 6), 10) / 10;
-    const discount = seat_type_code in discounts ? discounts[seat_type_code] : null;
+    const discount =
+      seat_type_code in discounts ? discounts[seat_type_code] : null;
     prices.push({
       seat_name: seat_type.name,
       short: seat_type.short,
@@ -928,7 +933,7 @@ server.tool(
     try {
       ticketsInfo = parseTicketsInfo(ticketsData, queryResponse.data.map);
     } catch (error) {
-      console.error('Error: parse tickets info failed. ',error);
+      console.error('Error: parse tickets info failed. ', error);
       return {
         content: [{ type: 'text', text: 'Error: parse tickets info failed. ' }],
       };
@@ -1105,7 +1110,12 @@ server.tool(
     // 请求成功，但查询有误
     if (typeof queryResponse.data == 'string') {
       return {
-        content: [{ type: 'text', text: `很抱歉，未查到相关的列车余票。(${queryResponse.errorMsg})` }],
+        content: [
+          {
+            type: 'text',
+            text: `很抱歉，未查到相关的列车余票。(${queryResponse.errorMsg})`,
+          },
+        ],
       };
     }
     // 请求和查询都没问题
@@ -1221,7 +1231,7 @@ async function getStations(): Promise<Record<string, StationData>> {
   if (html == null) {
     throw new Error('Error: get 12306 web page failed.');
   }
-  const match = html.match('.(/script/core/common/station_name.+?\.js)');
+  const match = html.match('.(/script/core/common/station_name.+?.js)');
   if (match == null) {
     throw new Error('Error: get station name js file failed.');
   }
@@ -1243,7 +1253,7 @@ async function getStations(): Promise<Record<string, StationData>> {
   return stationsData;
 }
 
-async function getLCQueryPath(): Promise<string> { 
+async function getLCQueryPath(): Promise<string> {
   const html = await make12306Request<string>(LCQUERY_INIT_URL);
   if (html == null) {
     throw new Error('Error: get 12306 web page failed.');
@@ -1258,10 +1268,74 @@ async function getLCQueryPath(): Promise<string> {
 async function init() {}
 
 async function main() {
-  const transport = new StdioServerTransport();
   await init();
-  await server.connect(transport);
-  console.error('12306 MCP Server running on stdio @Joooook');
+
+  const app = express();
+  app.use(express.json());
+
+  app.post('/mcp', async (req: Request, res: Response) => {
+    try {
+      // In stateless mode, create a new instance of transport and server for each request
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+
+      res.on('close', () => {
+        console.log('Request closed');
+        transport.close();
+        server.close();
+      });
+
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error('Error handling MCP request:', error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32603,
+            message: 'Internal server error',
+          },
+          id: null,
+        });
+      }
+    }
+  });
+
+  app.get('/mcp', async (req: Request, res: Response) => {
+    console.log('Received GET MCP request');
+    res.writeHead(405).end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: 'Method not allowed.',
+        },
+        id: null,
+      })
+    );
+  });
+
+  app.delete('/mcp', async (req: Request, res: Response) => {
+    console.log('Received DELETE MCP request');
+    res.writeHead(405).end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: 'Method not allowed.',
+        },
+        id: null,
+      })
+    );
+  });
+
+  // Start the server
+  const PORT = 3000;
+  app.listen(PORT, () => {
+    console.log(`12306 MCP Server running on HTTP port ${PORT} @Joooook`);
+  });
 }
 
 main().catch((error) => {
